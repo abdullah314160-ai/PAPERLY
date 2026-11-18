@@ -1,0 +1,121 @@
+name: Build Paperly Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-paperly:
+    name: Test & Build Paperly APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate Android Gradle project
+        shell: bash
+        run: |
+          set -e
+          SETTINGS_FILE="$(find . -maxdepth 4 -name "settings.gradle.kts" -o -name "settings.gradle" -not -path "*/.git/*" | sort | head -n 1)"
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            ZIP_FILE="$(find . -maxdepth 2 -name "*.zip" -not -path "*/.git/*" | head -n 1)"
+            if [ -n "$ZIP_FILE" ]; then
+              echo "Extracting project archive: $ZIP_FILE"
+              mkdir -p .ci-project
+              unzip -q "$ZIP_FILE" -d .ci-project
+              SETTINGS_FILE="$(find .ci-project -maxdepth 4 -name "settings.gradle.kts" -o -name "settings.gradle" | sort | head -n 1)"
+            fi
+          fi
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::No Gradle project (settings.gradle.kts) found in repository root or subdirectories."
+            echo "Files currently in repository:"
+            find . -maxdepth 3 -not -path "*/.git*"
+            echo ""
+            echo "Fix: Upload the extracted Paperly project files (settings.gradle.kts, build.gradle.kts, gradle/, app/) to the root of your GitHub repository."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(cd "$(dirname "$SETTINGS_FILE")" && pwd)"
+          echo "Detected Gradle project root: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK & install API 36
+        shell: bash
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_ROOT" ]; then
+            SDK_ROOT="$HOME/android-sdk"
+            mkdir -p "$SDK_ROOT"
+          fi
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ] && [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline-tools.zip
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-unpack
+            rm -rf "$SDK_ROOT/cmdline-tools/latest"
+            mv /tmp/cmdline-unpack/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+            rm -rf /tmp/cmdline-tools.zip /tmp/cmdline-unpack
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "platforms;android-36.1" \
+            "build-tools;36.0.0"
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Prepare debug keystore
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: Run unit & Robolectric tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle :app:testDebugUnitTest
+
+      - name: Build Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle :app:assembleDebug
+
+      - name: Upload Paperly Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Paperly-Android-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
